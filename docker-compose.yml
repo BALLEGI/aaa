@@ -1,0 +1,280 @@
+networks:
+  aion_bridge:
+    driver: bridge
+  lab_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  neo4j:
+    image: neo4j:5.15-community
+    container_name: neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - ./data/neo4j:/data
+    environment:
+      NEO4J_AUTH: neo4j/password_aion
+      NEO4J_PLUGINS: '["apoc"]'
+
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./data/prometheus:/prometheus
+
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./data/grafana:/var/lib/grafana
+
+  wazuh_manager:
+    image: wazuh/wazuh-manager:4.7.1
+    container_name: wazuh_manager
+    networks:
+      - aion_bridge
+    ports:
+      - "1514:1514"
+      - "514:514/udp"
+    environment:
+      - INDEXER_URL=https://wazuh_indexer:9200
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=SecretPassword123!
+      - API_USERNAME=admin
+      - API_PASSWORD=SecretPassword123!
+    volumes:
+      - ./data/wazuh_manager:/var/ossec/data
+    depends_on:
+      - wazuh_indexer
+
+  wazuh_indexer:
+    image: wazuh/wazuh-indexer:4.7.1
+    container_name: wazuh_indexer
+    environment:
+      - "discovery.type=single-node"
+      - "OPENSEARCH_INITIAL_ADMIN_PASSWORD=SecretPassword123!"
+    volumes:
+      - ./data/wazuh_indexer:/var/lib/wazuh-indexer
+
+  wazuh_dashboard:
+    image: wazuh/wazuh-dashboard:4.7.1
+    container_name: wazuh_dashboard
+    ports:
+      - "4444:5601"
+    environment:
+      - INDEXER_URL=https://wazuh_indexer:9200
+      - INDEXER_USERNAME=admin
+      - INDEXER_PASSWORD=SecretPassword123!
+      - SERVER_URL=https://wazuh_manager:55000
+      - SERVER_USERNAME=admin
+      - SERVER_PASSWORD=SecretPassword123!
+    depends_on:
+      - wazuh_manager
+      - wazuh_indexer
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.11.0
+    container_name: filebeat
+    user: root
+    volumes:
+      - ./config/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - ./data/wazuh_manager/alerts:/var/ossec/logs/alerts:ro
+    command: filebeat -e -strict.perms=false
+    depends_on:
+      - kafka
+      - wazuh_manager
+
+  web_target:
+    image: nginx:alpine
+    container_name: web_target
+    networks:
+      - lab_net
+    ports:
+      - "8080:80"
+
+  ssh_target:
+    # Changement d'image pour une version plus standard
+    image: lscr.io/linuxserver/openssh-server:latest
+    container_name: ssh_target
+    networks:
+      - lab_net
+      - aion_bridge
+    ports:
+      - "2222:2222"
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - USER_PASSWORD=12345
+      - USER_NAME=user
+    volumes:
+      - ./config/ssh_agent_install.sh:/agent_install.sh
+    # Suppression de la commande complexe car l'image linuxserver gère mieux l'init
+    depends_on:
+      - wazuh_manager
+
+  ftp_target:
+    image: fauria/vsftpd
+    container_name: ftp_target
+    networks:
+      - lab_net
+    ports:
+      - "21:21"
+      - "21100-21110:21100-21110"
+    environment:
+      - FTP_USER=user
+      - FTP_PASS=12345
+      - PASV_ADDRESS=127.0.0.1
+
+  attacker_bot:
+    image: alpine:latest
+    container_name: attacker_bot
+    networks:
+      - lab_net
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ./config/attack_sim.sh:/attack_sim.sh
+    # Ajout d'installation d'outils réseaux pour le script d'attaque
+    command: /bin/sh -c "apk add --no-cache curl nmap && sleep 45 && chmod +x /attack_sim.sh && /attack_sim.sh"
+    depends_on:
+      - web_target
+      - ssh_target
+      - ftp_target
+
+  zeek:
+    # CORRECTION : Utilisation de l'image officielle actuelle
+    image: zeek/zeek:6.0
+    container_name: zeek
+    network_mode: service:attacker_bot
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - IPC_LOCK
+    volumes:
+      - ./config/zeek/local.zeek:/opt/zeek/share/zeek/site/local.zeek:ro
+      - ./data/zeek_logs:/opt/zeek/logs
+    depends_on:
+      - attacker_bot
+    command: /bin/bash -c "zeek -i eth0 local && tail -f /opt/zeek/logs/current/conn.log"
+
+  zeek_adapter:
+    build:
+      context: ./python_scripts
+      dockerfile: Dockerfile
+    container_name: zeek_adapter
+    restart: always
+    depends_on:
+      - kafka
+      - zeek
+    volumes:
+      - ./data/zeek_logs:/zeek_logs:ro
+    environment:
+      - KAFKA_SERVER=kafka:29092
+      - ZEEK_LOG_PATH=/zeek_logs/current
+      - LOG_TOPIC=network_logs
+    command: python zeek_adapter.py
+
+  graph_builder:
+    build:
+      context: ./python_scripts
+      dockerfile: Dockerfile
+    container_name: graph_builder
+    restart: always
+    depends_on:
+      - kafka
+      - neo4j
+      - wazuh_manager
+    environment:
+      - KAFKA_SERVER=kafka:29092
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=password_aion
+      - NETWORK_TOPIC=network_logs
+      - WAZUH_TOPIC=wazuh_alerts
+      - AI_ALERT_TOPIC=ai_anomaly_alerts
+    command: python graph_builder.py
+
+  ai_trainer:
+    build:
+      context: ./python_scripts
+      dockerfile: Dockerfile
+    container_name: ai_trainer
+    depends_on:
+      - kafka
+    volumes:
+      - ./python_scripts:/app
+      - ./data/ai_models:/models
+    environment:
+      - KAFKA_SERVER=kafka:29092
+      - NETWORK_TOPIC=network_logs
+    command: /bin/bash -c "python generate_dataset.py && python train_vae.py"
+    profiles:
+      - training
+
+  ai_inference:
+    build:
+      context: ./python_scripts
+      dockerfile: Dockerfile
+    container_name: ai_inference
+    restart: always
+    depends_on:
+      - kafka
+    volumes:
+      - ./python_scripts:/app
+      - ./data/ai_models:/models
+    environment:
+      - KAFKA_SERVER=kafka:29092
+      - NETWORK_TOPIC=network_logs
+    command: python inference_vae.py
+
+  web_dashboard:
+    build:
+      context: ./web_dashboard
+      dockerfile: Dockerfile
+    container_name: web_dashboard
+    ports:
+      - "5000:5000"
+    depends_on:
+      - neo4j
+      - ai_inference
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=password_aion
+    restart: always
